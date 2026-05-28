@@ -8,7 +8,7 @@ strategy("IFVG Strategy – MNQ 5min", overlay=true,
 i_htf_ema     = input.int(20,    "HTF EMA period (1H & 2H)",          group="HTF Bias")
 
 i_fvg_min     = input.float(3.0,  "Min 5m FVG size (pts)",            group="FVG", step=0.25)
-i_htf_fvg_min = input.float(10.0, "Min 1H FVG size (pts)",            group="FVG", step=1.0)
+i_htf_fvg_min = input.float(10.0, "Min HTF FVG size (pts)",            group="FVG", step=1.0)
 i_swing_lb    = input.int(10,    "Swing lookback (bars)",              group="FVG")
 
 i_risk        = input.float(100.0, "Risk per trade ($)",               group="Risk")
@@ -53,45 +53,86 @@ bear_sweep = bear_sweep_pd or bear_sweep_so
 bull_swept = ta.barssince(bull_sweep) <= 20
 bear_swept = ta.barssince(bear_sweep) <= 20
 
-// ─── 1H FVG ZONES (opposing direction — where price delivers from) ─────────────
-// For a LONG: price taps a BEARISH 1H FVG (opposing the upward delivery)
-// Bearish 1H FVG: high[0] < low[2] on the 1H chart
-h1_bear_new    = request.security(syminfo.tickerid, "60", high < low[2] and (low[2] - high) >= i_htf_fvg_min, lookahead=barmerge.lookahead_off)
-h1_bear_fvg_hi = request.security(syminfo.tickerid, "60", low[2],  lookahead=barmerge.lookahead_off)
-h1_bear_fvg_lo = request.security(syminfo.tickerid, "60", high,    lookahead=barmerge.lookahead_off)
+// ─── HTF FVG ZONES (15m, 30m, 1H, 2H — opposing direction) ──────────────────
+// For a LONG: price must be tapping a BEARISH FVG on ANY of these TFs
+// For a SHORT: price must be tapping a BULLISH FVG on ANY of these TFs
 
-// For a SHORT: price taps a BULLISH 1H FVG
-// Bullish 1H FVG: low[0] > high[2] on the 1H chart
-h1_bull_new    = request.security(syminfo.tickerid, "60", low > high[2] and (low - high[2]) >= i_htf_fvg_min, lookahead=barmerge.lookahead_off)
-h1_bull_fvg_hi = request.security(syminfo.tickerid, "60", low,     lookahead=barmerge.lookahead_off)
-h1_bull_fvg_lo = request.security(syminfo.tickerid, "60", high[2], lookahead=barmerge.lookahead_off)
+// 15m
+[tf15_bear_new, tf15_bear_hi_r, tf15_bear_lo_r] = request.security(syminfo.tickerid, "15",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf15_bull_new, tf15_bull_hi_r, tf15_bull_lo_r] = request.security(syminfo.tickerid, "15",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
 
-// Store the most recent 1H FVG zones persistently
-var float htf_bear_hi = na
-var float htf_bear_lo = na
-var float htf_bull_hi = na
-var float htf_bull_lo = na
+// 30m
+[tf30_bear_new, tf30_bear_hi_r, tf30_bear_lo_r] = request.security(syminfo.tickerid, "30",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf30_bull_new, tf30_bull_hi_r, tf30_bull_lo_r] = request.security(syminfo.tickerid, "30",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
 
-if h1_bear_new
-    htf_bear_hi := h1_bear_fvg_hi
-    htf_bear_lo := h1_bear_fvg_lo
+// 1H
+[tf60_bear_new, tf60_bear_hi_r, tf60_bear_lo_r] = request.security(syminfo.tickerid, "60",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf60_bull_new, tf60_bull_hi_r, tf60_bull_lo_r] = request.security(syminfo.tickerid, "60",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
 
-if h1_bull_new
-    htf_bull_hi := h1_bull_fvg_hi
-    htf_bull_lo := h1_bull_fvg_lo
+// 2H
+[tf120_bear_new, tf120_bear_hi_r, tf120_bear_lo_r] = request.security(syminfo.tickerid, "120",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf120_bull_new, tf120_bull_hi_r, tf120_bull_lo_r] = request.security(syminfo.tickerid, "120",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
 
-// Invalidate if price closes beyond the zone (mitigated)
-if not na(htf_bear_lo) and close > htf_bear_hi
-    htf_bear_hi := na
-    htf_bear_lo := na
+// Persist the most recent zone for each TF
+var float tf15_bear_hi  = na
+var float tf15_bear_lo  = na
+var float tf15_bull_hi  = na
+var float tf15_bull_lo  = na
+var float tf30_bear_hi  = na
+var float tf30_bear_lo  = na
+var float tf30_bull_hi  = na
+var float tf30_bull_lo  = na
+var float tf60_bear_hi  = na
+var float tf60_bear_lo  = na
+var float tf60_bull_hi  = na
+var float tf60_bull_lo  = na
+var float tf120_bear_hi = na
+var float tf120_bear_lo = na
+var float tf120_bull_hi = na
+var float tf120_bull_lo = na
 
-if not na(htf_bull_lo) and close < htf_bull_lo
-    htf_bull_hi := na
-    htf_bull_lo := na
+// Update zones when a new FVG forms
+if tf15_bear_new  => tf15_bear_hi  := tf15_bear_hi_r,  tf15_bear_lo  := tf15_bear_lo_r
+if tf15_bull_new  => tf15_bull_hi  := tf15_bull_hi_r,  tf15_bull_lo  := tf15_bull_lo_r
+if tf30_bear_new  => tf30_bear_hi  := tf30_bear_hi_r,  tf30_bear_lo  := tf30_bear_lo_r
+if tf30_bull_new  => tf30_bull_hi  := tf30_bull_hi_r,  tf30_bull_lo  := tf30_bull_lo_r
+if tf60_bear_new  => tf60_bear_hi  := tf60_bear_hi_r,  tf60_bear_lo  := tf60_bear_lo_r
+if tf60_bull_new  => tf60_bull_hi  := tf60_bull_hi_r,  tf60_bull_lo  := tf60_bull_lo_r
+if tf120_bear_new => tf120_bear_hi := tf120_bear_hi_r, tf120_bear_lo := tf120_bear_lo_r
+if tf120_bull_new => tf120_bull_hi := tf120_bull_hi_r, tf120_bull_lo := tf120_bull_lo_r
 
-// Is current 5m price tapping into the HTF FVG?
-in_htf_bear_fvg = not na(htf_bear_lo) and close >= htf_bear_lo and close <= htf_bear_hi
-in_htf_bull_fvg = not na(htf_bull_lo) and close >= htf_bull_lo and close <= htf_bull_hi
+// Invalidate a zone if price closes through it (fully mitigated)
+if not na(tf15_bear_lo)  and close > tf15_bear_hi  => tf15_bear_hi  := na, tf15_bear_lo  := na
+if not na(tf15_bull_lo)  and close < tf15_bull_lo  => tf15_bull_hi  := na, tf15_bull_lo  := na
+if not na(tf30_bear_lo)  and close > tf30_bear_hi  => tf30_bear_hi  := na, tf30_bear_lo  := na
+if not na(tf30_bull_lo)  and close < tf30_bull_lo  => tf30_bull_hi  := na, tf30_bull_lo  := na
+if not na(tf60_bear_lo)  and close > tf60_bear_hi  => tf60_bear_hi  := na, tf60_bear_lo  := na
+if not na(tf60_bull_lo)  and close < tf60_bull_lo  => tf60_bull_hi  := na, tf60_bull_lo  := na
+if not na(tf120_bear_lo) and close > tf120_bear_hi => tf120_bear_hi := na, tf120_bear_lo := na
+if not na(tf120_bull_lo) and close < tf120_bull_lo => tf120_bull_hi := na, tf120_bull_lo := na
+
+// In zone check helpers
+in_zone(hi, lo) => not na(lo) and close >= lo and close <= hi
+
+// Is price tapping into a bearish HTF FVG on ANY valid TF? (bull setup condition)
+in_htf_bear_fvg = in_zone(tf15_bear_hi,  tf15_bear_lo)  or
+                  in_zone(tf30_bear_hi,  tf30_bear_lo)  or
+                  in_zone(tf60_bear_hi,  tf60_bear_lo)  or
+                  in_zone(tf120_bear_hi, tf120_bear_lo)
+
+// Is price tapping into a bullish HTF FVG on ANY valid TF? (bear setup condition)
+in_htf_bull_fvg = in_zone(tf15_bull_hi,  tf15_bull_lo)  or
+                  in_zone(tf30_bull_hi,  tf30_bull_lo)  or
+                  in_zone(tf60_bull_hi,  tf60_bull_lo)  or
+                  in_zone(tf120_bull_hi, tf120_bull_lo)
 
 // ─── 5M FVG DETECTION ─────────────────────────────────────────────────────────
 new_bull_fvg = low > high[2] and (low - high[2]) >= i_fvg_min
