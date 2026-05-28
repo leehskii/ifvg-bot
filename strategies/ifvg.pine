@@ -1,30 +1,69 @@
 //@version=5
-strategy("IFVG Bot Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+strategy("IFVG Bot – NQ 5min", overlay=true,
+         default_qty_type=strategy.fixed,
+         default_qty_value=1,
+         calc_on_every_tick=false)
 
-// --- Inputs ---
-lookback     = input.int(3,   title="Lookback bars for FVG",   minval=2)
-fvg_min_size = input.float(0.0, title="Minimum FVG size (points)", minval=0.0)
-webhook_msg  = input.string("{{strategy.order.action}},{{ticker}},{{close}}", title="Webhook message template")
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+fvg_min_pts  = input.float(5.0,  "Min FVG size (points)",   minval=0.5, step=0.25)
+rr_ratio     = input.float(2.0,  "Risk:Reward ratio",       minval=1.0, step=0.5)
+session      = input.session("0930-1600", "Trading session (Exchange TZ)")
+qty          = input.int(1,      "Contracts per trade",     minval=1)
 
-// --- Fair Value Gap detection ---
-// A bullish FVG exists when: low[0] > high[2]  (gap between candle i-2 high and candle i low)
-// A bearish FVG exists when: high[0] < low[2]
+// ─── Session filter ───────────────────────────────────────────────────────────
+in_session = not na(time("5", session))
 
-bullish_fvg = low > high[2] and (low - high[2]) >= fvg_min_size
-bearish_fvg = high < low[2] and (low[2] - high) >= fvg_min_size
+// ─── Fair Value Gap detection ─────────────────────────────────────────────────
+// Bullish FVG : gap between high[2] and low[0]  (low[0] > high[2])
+// Bearish FVG : gap between low[2]  and high[0] (high[0] < low[2])
+bull_fvg_size = low - high[2]
+bear_fvg_size = low[2] - high
 
-// --- Imbalance confirmation (price returns to fill the gap) ---
-bull_entry = bullish_fvg[lookback] and close <= high[2 + lookback] + (low[lookback] - high[2 + lookback]) * 0.5
-bear_entry = bearish_fvg[lookback] and close >= low[2 + lookback] - (low[2 + lookback] - high[lookback]) * 0.5
+bull_fvg = bull_fvg_size >= fvg_min_pts
+bear_fvg = bear_fvg_size >= fvg_min_pts
 
-// --- Orders ---
+// ─── Entry: price retraces into the imbalance zone ───────────────────────────
+// For a bullish FVG on bar i: zone is high[2]..low[0]
+// Entry next bar when close ticks back into that zone
+bull_zone_hi = high[2 + 1]  // top of bull FVG from 1 bar ago
+bull_zone_lo = low[1]        // bottom of bull FVG from 1 bar ago
+bear_zone_hi = low[2 + 1]
+bear_zone_lo = high[1]
+
+bull_entry = bull_fvg[1] and close <= bull_zone_hi and close >= bull_zone_lo and in_session and strategy.position_size == 0
+bear_entry = bear_fvg[1] and close >= bear_zone_lo and close <= bear_zone_hi and in_session and strategy.position_size == 0
+
+// ─── Stop & Target ────────────────────────────────────────────────────────────
+bull_stop   = bull_zone_lo - 1.0          // 1 point below FVG bottom
+bull_risk   = close - bull_stop
+bull_target = close + bull_risk * rr_ratio
+
+bear_stop   = bear_zone_hi + 1.0
+bear_risk   = bear_stop - close
+bear_target = close - bear_risk * rr_ratio
+
+// ─── Orders ───────────────────────────────────────────────────────────────────
 if bull_entry
-    strategy.entry("Long", strategy.long, alert_message=webhook_msg)
+    strategy.entry("Long", strategy.long, qty=qty,
+         alert_message='{"action":"buy","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(bull_stop) + ',"target":' + str.tostring(bull_target) + ',"qty":' + str.tostring(qty) + '}')
+    strategy.exit("Long TP/SL", from_entry="Long", stop=bull_stop, limit=bull_target)
 
 if bear_entry
-    strategy.entry("Short", strategy.short, alert_message=webhook_msg)
+    strategy.entry("Short", strategy.short, qty=qty,
+         alert_message='{"action":"sell","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(bear_stop) + ',"target":' + str.tostring(bear_target) + ',"qty":' + str.tostring(qty) + '}')
+    strategy.exit("Short TP/SL", from_entry="Short", stop=bear_stop, limit=bear_target)
 
-// --- Visuals ---
-bgcolor(bullish_fvg ? color.new(color.green, 85) : bearish_fvg ? color.new(color.red, 85) : na)
-plotshape(bull_entry, title="Bull IFVG", location=location.belowbar, color=color.green, style=shape.triangleup,  size=size.small)
-plotshape(bear_entry, title="Bear IFVG", location=location.abovebar, color=color.red,   style=shape.triangledown, size=size.small)
+// ─── Visuals ──────────────────────────────────────────────────────────────────
+var box bull_box = na
+var box bear_box = na
+
+if bull_fvg
+    bull_box := box.new(bar_index - 2, low, bar_index, high[2],
+         border_color=color.new(color.green, 0), bgcolor=color.new(color.green, 80))
+
+if bear_fvg
+    bear_box := box.new(bar_index - 2, high, bar_index, low[2],
+         border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 80))
+
+plotshape(bull_entry, "Bull Entry", shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(bear_entry, "Bear Entry", shape.triangledown, location.abovebar, color.red,   size=size.small)

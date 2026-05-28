@@ -1,7 +1,7 @@
 import requests
-from config import BASE_URL, TRADOVATE_USERNAME, TRADOVATE_PASSWORD, \
-    TRADOVATE_APP_ID, TRADOVATE_APP_VERSION, TRADOVATE_DEVICE_ID, \
-    TRADOVATE_CID, TRADOVATE_SECRET
+from config import (BASE_URL, TRADOVATE_USERNAME, TRADOVATE_PASSWORD,
+                    TRADOVATE_APP_ID, TRADOVATE_APP_VERSION,
+                    TRADOVATE_DEVICE_ID, TRADOVATE_CID, TRADOVATE_SECRET)
 
 
 class TradovateClient:
@@ -21,8 +21,7 @@ class TradovateClient:
         }
         resp = self.session.post(f"{BASE_URL}/auth/accesstokenrequest", json=payload)
         resp.raise_for_status()
-        data = resp.json()
-        self.access_token = data["accessToken"]
+        self.access_token = resp.json()["accessToken"]
         self.session.headers.update({"Authorization": f"Bearer {self.access_token}"})
         return self.access_token
 
@@ -31,18 +30,44 @@ class TradovateClient:
         resp.raise_for_status()
         return resp.json()
 
-    def place_order(self, account_id: int, symbol: str, action: str, qty: int = 1):
+    def get_contract_id(self, symbol: str) -> int:
+        resp = self.session.get(f"{BASE_URL}/contract/find", params={"name": symbol})
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    def place_bracket_order(self, account_id: int, symbol: str, action: str,
+                            qty: int, stop: float, target: float) -> dict:
         """
+        Places an OSO bracket: market entry + stop loss + profit target.
         action: "Buy" or "Sell"
         """
+        contract_id = self.get_contract_id(symbol)
+
+        # Opposite side for exit legs
+        exit_action = "Sell" if action == "Buy" else "Buy"
+
         payload = {
             "accountId":  account_id,
-            "symbol":     symbol,
+            "contractId": contract_id,
+            "action":     action,
             "orderQty":   qty,
             "orderType":  "Market",
-            "action":     action,
             "timeInForce": "GTC",
+            "bracket1": {
+                "action":     exit_action,
+                "orderType":  "Stop",
+                "stopPrice":  round(stop, 2),
+                "orderQty":   qty,
+                "timeInForce": "GTC",
+            },
+            "bracket2": {
+                "action":     exit_action,
+                "orderType":  "Limit",
+                "price":      round(target, 2),
+                "orderQty":   qty,
+                "timeInForce": "GTC",
+            },
         }
-        resp = self.session.post(f"{BASE_URL}/order/placeorder", json=payload)
+        resp = self.session.post(f"{BASE_URL}/order/placeoso", json=payload)
         resp.raise_for_status()
         return resp.json()
