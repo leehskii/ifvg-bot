@@ -1,69 +1,217 @@
 //@version=5
-strategy("IFVG Bot – MNQ 5min", overlay=true,
-         default_qty_type=strategy.fixed,
-         default_qty_value=1,
-         calc_on_every_tick=false)
+strategy("IFVG Strategy – MNQ 5min", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         calc_on_every_tick=false, process_orders_on_close=true,
+         max_boxes_count=100, max_lines_count=50)
 
-// ─── Inputs ───────────────────────────────────────────────────────────────────
-fvg_min_pts  = input.float(5.0,  "Min FVG size (points)",   minval=0.5, step=0.25)
-rr_ratio     = input.float(2.0,  "Risk:Reward ratio",       minval=1.0, step=0.5)
-session      = input.session("0930-1600", "Trading session (Exchange TZ)")
-qty          = input.int(1,      "Contracts per trade",     minval=1)
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+i_htf_ema     = input.int(20,    "HTF EMA period (1H & 2H)",          group="HTF Bias")
 
-// ─── Session filter ───────────────────────────────────────────────────────────
-in_session = not na(time("5", session))
+i_fvg_min     = input.float(3.0,  "Min 5m FVG size (pts)",            group="FVG", step=0.25)
+i_htf_fvg_min = input.float(10.0, "Min 1H FVG size (pts)",            group="FVG", step=1.0)
+i_swing_lb    = input.int(10,    "Swing lookback (bars)",              group="FVG")
 
-// ─── Fair Value Gap detection ─────────────────────────────────────────────────
-// Bullish FVG : gap between high[2] and low[0]  (low[0] > high[2])
-// Bearish FVG : gap between low[2]  and high[0] (high[0] < low[2])
-bull_fvg_size = low - high[2]
-bear_fvg_size = low[2] - high
+i_risk        = input.float(100.0, "Risk per trade ($)",               group="Risk")
+i_max_risk    = input.float(130.0, "Max allowed risk per trade ($)",   group="Risk")
+i_stop_buf    = input.float(10.0,  "Stop buffer beyond swing (pts)",   group="Risk", step=0.25)
+i_mnq_pt      = input.float(2.0,   "$ per point (MNQ=2, NQ=20)",      group="Risk")
+i_rr          = input.float(2.0,   "Risk:Reward target",               group="Risk", step=0.5)
 
-bull_fvg = bull_fvg_size >= fvg_min_pts
-bear_fvg = bear_fvg_size >= fvg_min_pts
+i_session     = input.session("0930-1600", "Trade session (ET)",       group="Session")
 
-// ─── Entry: price retraces into the imbalance zone ───────────────────────────
-// For a bullish FVG on bar i: zone is high[2]..low[0]
-// Entry next bar when close ticks back into that zone
-bull_zone_hi = high[2 + 1]  // top of bull FVG from 1 bar ago
-bull_zone_lo = low[1]        // bottom of bull FVG from 1 bar ago
-bear_zone_hi = low[2 + 1]
-bear_zone_lo = high[1]
+// ─── HTF BIAS (1H + 2H EMA) ───────────────────────────────────────────────────
+h1_close = request.security(syminfo.tickerid, "60",  close,                    lookahead=barmerge.lookahead_off)
+h2_close = request.security(syminfo.tickerid, "120", close,                    lookahead=barmerge.lookahead_off)
+h1_ema   = request.security(syminfo.tickerid, "60",  ta.ema(close, i_htf_ema), lookahead=barmerge.lookahead_off)
+h2_ema   = request.security(syminfo.tickerid, "120", ta.ema(close, i_htf_ema), lookahead=barmerge.lookahead_off)
 
-bull_entry = bull_fvg[1] and close <= bull_zone_hi and close >= bull_zone_lo and in_session and strategy.position_size == 0
-bear_entry = bear_fvg[1] and close >= bear_zone_lo and close <= bear_zone_hi and in_session and strategy.position_size == 0
+htf_bull = h1_close > h1_ema and h2_close > h2_ema
+htf_bear = h1_close < h1_ema and h2_close < h2_ema
 
-// ─── Stop & Target ────────────────────────────────────────────────────────────
-bull_stop   = bull_zone_lo - 1.0          // 1 point below FVG bottom
-bull_risk   = close - bull_stop
-bull_target = close + bull_risk * rr_ratio
+// ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────────
+// Previous day high/low — key liquidity targets for sweeps
+pd_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pd_low  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
 
-bear_stop   = bear_zone_hi + 1.0
-bear_risk   = bear_stop - close
-bear_target = close - bear_risk * rr_ratio
+// Current session open (another common liquidity level)
+var float sess_open = na
+in_session = not na(time("5", i_session, "America/New_York"))
+if in_session and not in_session[1]
+    sess_open := open
 
-// ─── Orders ───────────────────────────────────────────────────────────────────
+// ─── LIQUIDITY SWEEP DETECTION ────────────────────────────────────────────────
+// Sweep = wick beyond a key level, candle closes back on the other side
+bull_sweep_pd  = low < pd_low   and close > pd_low    // swept prev day low
+bear_sweep_pd  = high > pd_high and close < pd_high   // swept prev day high
+bull_sweep_so  = not na(sess_open) and low < sess_open  and close > sess_open
+bear_sweep_so  = not na(sess_open) and high > sess_open and close < sess_open
+
+bull_sweep = bull_sweep_pd or bull_sweep_so
+bear_sweep = bear_sweep_pd or bear_sweep_so
+
+// Trade remains valid for 20 bars after the sweep
+bull_swept = ta.barssince(bull_sweep) <= 20
+bear_swept = ta.barssince(bear_sweep) <= 20
+
+// ─── 1H FVG ZONES (opposing direction — where price delivers from) ─────────────
+// For a LONG: price taps a BEARISH 1H FVG (opposing the upward delivery)
+// Bearish 1H FVG: high[0] < low[2] on the 1H chart
+h1_bear_new    = request.security(syminfo.tickerid, "60", high < low[2] and (low[2] - high) >= i_htf_fvg_min, lookahead=barmerge.lookahead_off)
+h1_bear_fvg_hi = request.security(syminfo.tickerid, "60", low[2],  lookahead=barmerge.lookahead_off)
+h1_bear_fvg_lo = request.security(syminfo.tickerid, "60", high,    lookahead=barmerge.lookahead_off)
+
+// For a SHORT: price taps a BULLISH 1H FVG
+// Bullish 1H FVG: low[0] > high[2] on the 1H chart
+h1_bull_new    = request.security(syminfo.tickerid, "60", low > high[2] and (low - high[2]) >= i_htf_fvg_min, lookahead=barmerge.lookahead_off)
+h1_bull_fvg_hi = request.security(syminfo.tickerid, "60", low,     lookahead=barmerge.lookahead_off)
+h1_bull_fvg_lo = request.security(syminfo.tickerid, "60", high[2], lookahead=barmerge.lookahead_off)
+
+// Store the most recent 1H FVG zones persistently
+var float htf_bear_hi = na
+var float htf_bear_lo = na
+var float htf_bull_hi = na
+var float htf_bull_lo = na
+
+if h1_bear_new
+    htf_bear_hi := h1_bear_fvg_hi
+    htf_bear_lo := h1_bear_fvg_lo
+
+if h1_bull_new
+    htf_bull_hi := h1_bull_fvg_hi
+    htf_bull_lo := h1_bull_fvg_lo
+
+// Invalidate if price closes beyond the zone (mitigated)
+if not na(htf_bear_lo) and close > htf_bear_hi
+    htf_bear_hi := na
+    htf_bear_lo := na
+
+if not na(htf_bull_lo) and close < htf_bull_lo
+    htf_bull_hi := na
+    htf_bull_lo := na
+
+// Is current 5m price tapping into the HTF FVG?
+in_htf_bear_fvg = not na(htf_bear_lo) and close >= htf_bear_lo and close <= htf_bear_hi
+in_htf_bull_fvg = not na(htf_bull_lo) and close >= htf_bull_lo and close <= htf_bull_hi
+
+// ─── 5M FVG DETECTION ─────────────────────────────────────────────────────────
+new_bull_fvg = low > high[2] and (low - high[2]) >= i_fvg_min
+new_bear_fvg = high < low[2] and (low[2] - high) >= i_fvg_min
+
+var float bull_fvg_hi = na
+var float bull_fvg_lo = na
+var bool  bull_fvg_on = false
+var float bear_fvg_hi = na
+var float bear_fvg_lo = na
+var bool  bear_fvg_on = false
+
+if new_bull_fvg
+    bull_fvg_hi := low       // top of gap = current bar's low
+    bull_fvg_lo := high[2]   // bot of gap = 2 bars ago high
+    bull_fvg_on := true
+
+if new_bear_fvg
+    bear_fvg_hi := low[2]    // top of gap = 2 bars ago low
+    bear_fvg_lo := high      // bot of gap = current bar's high
+    bear_fvg_on := true
+
+// Invalidate FVG if price closes beyond it
+if bull_fvg_on and close < bull_fvg_lo
+    bull_fvg_on := false
+
+if bear_fvg_on and close > bear_fvg_hi
+    bear_fvg_on := false
+
+// IFVG entry: price has retraced back into the 5m FVG zone
+bull_ifvg = bull_fvg_on and close >= bull_fvg_lo and close <= bull_fvg_hi
+bear_ifvg = bear_fvg_on and close >= bear_fvg_lo and close <= bear_fvg_hi
+
+// ─── DYNAMIC STOP LOSS (previous swing + buffer) ──────────────────────────────
+bull_stop = ta.lowest(low, i_swing_lb)  - i_stop_buf
+bear_stop = ta.highest(high, i_swing_lb) + i_stop_buf
+
+// ─── POSITION SIZING ($100 risk cap) ──────────────────────────────────────────
+bull_dist    = math.max(close - bull_stop, 0.25)
+bear_dist    = math.max(bear_stop - close, 0.25)
+bull_risk_1c = bull_dist * i_mnq_pt
+bear_risk_1c = bear_dist * i_mnq_pt
+
+// Contracts = floor($100 / risk per contract), min 1
+bull_qty  = math.max(1.0, math.floor(i_risk / bull_risk_1c))
+bear_qty  = math.max(1.0, math.floor(i_risk / bear_risk_1c))
+
+// Skip if even 1 contract exceeds the max risk threshold
+bull_skip = bull_risk_1c > i_max_risk
+bear_skip = bear_risk_1c > i_max_risk
+
+// Actual USD risk for display / webhook
+bull_actual_risk = bull_qty * bull_risk_1c
+bear_actual_risk = bear_qty * bear_risk_1c
+
+// ─── TARGETS & BREAK EVEN ─────────────────────────────────────────────────────
+bull_target = close + bull_dist * i_rr
+bull_be     = close + bull_dist          // 1R hit = move stop to entry
+bear_target = close - bear_dist * i_rr
+bear_be     = close - bear_dist
+
+// ─── ENTRY CONDITIONS (ALL must be true) ──────────────────────────────────────
+bull_entry = htf_bull
+           and bull_swept
+           and in_htf_bear_fvg
+           and bull_ifvg
+           and not bull_skip
+           and in_session
+           and strategy.position_size == 0
+
+bear_entry = htf_bear
+           and bear_swept
+           and in_htf_bull_fvg
+           and bear_ifvg
+           and not bear_skip
+           and in_session
+           and strategy.position_size == 0
+
+// ─── ORDERS ───────────────────────────────────────────────────────────────────
 if bull_entry
-    strategy.entry("Long", strategy.long, qty=qty,
-         alert_message='{"action":"buy","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(bull_stop) + ',"target":' + str.tostring(bull_target) + ',"qty":' + str.tostring(qty) + '}')
-    strategy.exit("Long TP/SL", from_entry="Long", stop=bull_stop, limit=bull_target)
+    bull_fvg_on := false
+    strategy.entry("Long", strategy.long, qty=bull_qty,
+         alert_message='{"action":"buy","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(math.round(bull_stop, 2)) + ',"target":' + str.tostring(math.round(bull_target, 2)) + ',"be":' + str.tostring(math.round(bull_be, 2)) + ',"qty":' + str.tostring(bull_qty, "#") + ',"risk":' + str.tostring(math.round(bull_actual_risk, 2)) + '}')
+    strategy.exit("Long Exit", from_entry="Long", stop=bull_stop, limit=bull_target)
 
 if bear_entry
-    strategy.entry("Short", strategy.short, qty=qty,
-         alert_message='{"action":"sell","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(bear_stop) + ',"target":' + str.tostring(bear_target) + ',"qty":' + str.tostring(qty) + '}')
-    strategy.exit("Short TP/SL", from_entry="Short", stop=bear_stop, limit=bear_target)
+    bear_fvg_on := false
+    strategy.entry("Short", strategy.short, qty=bear_qty,
+         alert_message='{"action":"sell","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(math.round(bear_stop, 2)) + ',"target":' + str.tostring(math.round(bear_target, 2)) + ',"be":' + str.tostring(math.round(bear_be, 2)) + ',"qty":' + str.tostring(bear_qty, "#") + ',"risk":' + str.tostring(math.round(bear_actual_risk, 2)) + '}')
+    strategy.exit("Short Exit", from_entry="Short", stop=bear_stop, limit=bear_target)
 
-// ─── Visuals ──────────────────────────────────────────────────────────────────
-var box bull_box = na
-var box bear_box = na
+// ─── VISUALS ──────────────────────────────────────────────────────────────────
+// Previous day H/L liquidity lines
+plot(pd_high, "PDH", color=color.new(color.orange, 20), linewidth=1, style=plot.style_stepline)
+plot(pd_low,  "PDL", color=color.new(color.orange, 20), linewidth=1, style=plot.style_stepline)
 
-if bull_fvg
-    bull_box := box.new(bar_index - 2, low, bar_index, high[2],
-         border_color=color.new(color.green, 0), bgcolor=color.new(color.green, 80))
+// HTF bias label (top right)
+var label bias_lbl = na
+label.delete(bias_lbl)
+bias_txt   = htf_bull ? "HTF: BULL" : htf_bear ? "HTF: BEAR" : "HTF: NEUTRAL"
+bias_color = htf_bull ? color.green : htf_bear ? color.red : color.gray
+bias_lbl  := label.new(bar_index, high, bias_txt, style=label.style_label_left,
+              color=bias_color, textcolor=color.white, size=size.small)
 
-if bear_fvg
-    bear_box := box.new(bar_index - 2, high, bar_index, low[2],
-         border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 80))
+// HTF FVG zones (background shading)
+bgcolor(in_htf_bear_fvg ? color.new(color.green, 88) : na, title="In HTF Bear FVG (bull setup zone)")
+bgcolor(in_htf_bull_fvg ? color.new(color.red,   88) : na, title="In HTF Bull FVG (bear setup zone)")
 
-plotshape(bull_entry, "Bull Entry", shape.triangleup,   location.belowbar, color.green, size=size.small)
-plotshape(bear_entry, "Bear Entry", shape.triangledown, location.abovebar, color.red,   size=size.small)
+// 5m FVG boxes
+if new_bull_fvg
+    box.new(bar_index - 2, bull_fvg_hi, bar_index + 8, bull_fvg_lo,
+         border_color=color.new(color.teal, 20),  bgcolor=color.new(color.teal, 80))
+if new_bear_fvg
+    box.new(bar_index - 2, bear_fvg_hi, bar_index + 8, bear_fvg_lo,
+         border_color=color.new(color.maroon, 20), bgcolor=color.new(color.maroon, 80))
+
+// Sweep markers
+plotshape(bull_sweep, "Bull Sweep", shape.xcross, location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(bear_sweep, "Bear Sweep", shape.xcross, location.abovebar, color.new(color.red,   0), size=size.tiny)
+
+// Entry signals
+plotshape(bull_entry, "Long Entry",  shape.triangleup,   location.belowbar, color.lime, size=size.normal)
+plotshape(bear_entry, "Short Entry", shape.triangledown, location.abovebar, color.red,  size=size.normal)
