@@ -1,5 +1,5 @@
 //@version=5
-strategy("IFVG Bot – NQ 5min", overlay=true,
+strategy("IFVG Bot – MNQ 5min", overlay=true,
          default_qty_type=strategy.fixed,
          default_qty_value=1,
          calc_on_every_tick=false)

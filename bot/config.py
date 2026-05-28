@@ -23,8 +23,8 @@ BASE_URLS = {
 }
 BASE_URL = BASE_URLS[TRADOVATE_ENV]
 
-# NQ instrument details
-# Swap to "MNQM5" and TICK_VALUE=2.0 to trade Micro NQ instead
-INSTRUMENT    = os.getenv("INSTRUMENT", "NQM5")   # update expiry each quarter
+# MNQ (Micro E-mini Nasdaq) instrument details
+# Swap INSTRUMENT to "NQM5" and TICK_VALUE to 20.0 for full NQ
+INSTRUMENT    = os.getenv("INSTRUMENT", "MNQM5")  # update expiry each quarter
 TICK_SIZE     = 0.25   # minimum price move in points
-TICK_VALUE    = 20.0   # USD per tick (NQ full) — MNQ = 2.0
+TICK_VALUE    = 2.0    # USD per tick — MNQ=$2, NQ=$20
