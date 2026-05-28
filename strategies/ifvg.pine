@@ -53,9 +53,9 @@ bear_sweep = bear_sweep_pd or bear_sweep_so
 bull_swept = ta.barssince(bull_sweep) <= 20
 bear_swept = ta.barssince(bear_sweep) <= 20
 
-// ─── HTF FVG ZONES (15m, 30m, 1H, 2H — opposing direction) ──────────────────
-// For a LONG: price must be tapping a BEARISH FVG on ANY of these TFs
-// For a SHORT: price must be tapping a BULLISH FVG on ANY of these TFs
+// ─── HTF FVG ZONES (15m, 30m, 1H, 2H) ────────────────────────────────────────
+// For a LONG: a low is swept INSIDE a BULLISH HTF FVG → price delivers up
+// For a SHORT: a high is swept INSIDE a BEARISH HTF FVG → price delivers down
 
 // 15m
 [tf15_bear_new, tf15_bear_hi_r, tf15_bear_lo_r] = request.security(syminfo.tickerid, "15",
@@ -194,18 +194,23 @@ bull_be     = close + bull_dist          // 1R hit = move stop to entry
 bear_target = close - bear_dist * i_rr
 bear_be     = close - bear_dist
 
+// ─── DELIVERY CONFIRMATION ────────────────────────────────────────────────────
+// Sweep must have occurred INSIDE the HTF FVG — that's the delivery origin
+bull_delivery = ta.barssince(bull_sweep and in_htf_bull_fvg) <= 20
+bear_delivery = ta.barssince(bear_sweep and in_htf_bear_fvg) <= 20
+
 // ─── ENTRY CONDITIONS (ALL must be true) ──────────────────────────────────────
 bull_entry = htf_bull
-           and bull_swept
-           and in_htf_bear_fvg
+           and bull_delivery
+           and in_htf_bull_fvg
            and bull_ifvg
            and not bull_skip
            and in_session
            and strategy.position_size == 0
 
 bear_entry = htf_bear
-           and bear_swept
-           and in_htf_bull_fvg
+           and bear_delivery
+           and in_htf_bear_fvg
            and bear_ifvg
            and not bear_skip
            and in_session
@@ -238,8 +243,8 @@ bias_lbl  := label.new(bar_index, high, bias_txt, style=label.style_label_left,
               color=bias_color, textcolor=color.white, size=size.small)
 
 // HTF FVG zones (background shading)
-bgcolor(in_htf_bear_fvg ? color.new(color.green, 88) : na, title="In HTF Bear FVG (bull setup zone)")
-bgcolor(in_htf_bull_fvg ? color.new(color.red,   88) : na, title="In HTF Bull FVG (bear setup zone)")
+bgcolor(in_htf_bull_fvg ? color.new(color.green, 88) : na, title="In HTF Bull FVG (long delivery zone)")
+bgcolor(in_htf_bear_fvg ? color.new(color.red,   88) : na, title="In HTF Bear FVG (short delivery zone)")
 
 // 5m FVG boxes
 if new_bull_fvg
