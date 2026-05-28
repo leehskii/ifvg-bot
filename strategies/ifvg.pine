@@ -1,69 +1,275 @@
 //@version=5
-strategy("IFVG Bot – MNQ 5min", overlay=true,
-         default_qty_type=strategy.fixed,
-         default_qty_value=1,
-         calc_on_every_tick=false)
+strategy("IFVG Strategy – MNQ 5min", overlay=true,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         calc_on_every_tick=false, process_orders_on_close=true,
+         max_boxes_count=100, max_lines_count=50)
 
-// ─── Inputs ───────────────────────────────────────────────────────────────────
-fvg_min_pts  = input.float(5.0,  "Min FVG size (points)",   minval=0.5, step=0.25)
-rr_ratio     = input.float(2.0,  "Risk:Reward ratio",       minval=1.0, step=0.5)
-session      = input.session("0930-1600", "Trading session (Exchange TZ)")
-qty          = input.int(1,      "Contracts per trade",     minval=1)
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+i_htf_ema     = input.int(20,    "HTF EMA period (1H & 2H)",          group="HTF Bias")
 
-// ─── Session filter ───────────────────────────────────────────────────────────
-in_session = not na(time("5", session))
+i_fvg_min     = input.float(3.0,  "Min 5m FVG size (pts)",            group="FVG", step=0.25)
+i_htf_fvg_min = input.float(10.0, "Min HTF FVG size (pts)",            group="FVG", step=1.0)
+i_sweep_gap   = input.float(20.0, "Max sweep-to-FVG gap (pts)",        group="FVG", step=1.0)
+i_swing_lb    = input.int(10,    "Swing lookback (bars)",              group="FVG")
 
-// ─── Fair Value Gap detection ─────────────────────────────────────────────────
-// Bullish FVG : gap between high[2] and low[0]  (low[0] > high[2])
-// Bearish FVG : gap between low[2]  and high[0] (high[0] < low[2])
-bull_fvg_size = low - high[2]
-bear_fvg_size = low[2] - high
+i_risk        = input.float(100.0, "Risk per trade ($)",               group="Risk")
+i_max_risk    = input.float(130.0, "Max allowed risk per trade ($)",   group="Risk")
+i_stop_buf    = input.float(10.0,  "Stop buffer beyond swing (pts)",   group="Risk", step=0.25)
+i_mnq_pt      = input.float(2.0,   "$ per point (MNQ=2, NQ=20)",      group="Risk")
+i_rr          = input.float(2.0,   "Risk:Reward target",               group="Risk", step=0.5)
 
-bull_fvg = bull_fvg_size >= fvg_min_pts
-bear_fvg = bear_fvg_size >= fvg_min_pts
+i_session     = input.session("0930-1600", "Trade session (ET)",       group="Session")
 
-// ─── Entry: price retraces into the imbalance zone ───────────────────────────
-// For a bullish FVG on bar i: zone is high[2]..low[0]
-// Entry next bar when close ticks back into that zone
-bull_zone_hi = high[2 + 1]  // top of bull FVG from 1 bar ago
-bull_zone_lo = low[1]        // bottom of bull FVG from 1 bar ago
-bear_zone_hi = low[2 + 1]
-bear_zone_lo = high[1]
+// ─── HTF BIAS (1H + 2H EMA) ───────────────────────────────────────────────────
+h1_close = request.security(syminfo.tickerid, "60",  close,                    lookahead=barmerge.lookahead_off)
+h2_close = request.security(syminfo.tickerid, "120", close,                    lookahead=barmerge.lookahead_off)
+h1_ema   = request.security(syminfo.tickerid, "60",  ta.ema(close, i_htf_ema), lookahead=barmerge.lookahead_off)
+h2_ema   = request.security(syminfo.tickerid, "120", ta.ema(close, i_htf_ema), lookahead=barmerge.lookahead_off)
 
-bull_entry = bull_fvg[1] and close <= bull_zone_hi and close >= bull_zone_lo and in_session and strategy.position_size == 0
-bear_entry = bear_fvg[1] and close >= bear_zone_lo and close <= bear_zone_hi and in_session and strategy.position_size == 0
+htf_bull = h1_close > h1_ema and h2_close > h2_ema
+htf_bear = h1_close < h1_ema and h2_close < h2_ema
 
-// ─── Stop & Target ────────────────────────────────────────────────────────────
-bull_stop   = bull_zone_lo - 1.0          // 1 point below FVG bottom
-bull_risk   = close - bull_stop
-bull_target = close + bull_risk * rr_ratio
+// ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────────
+// Previous day high/low — key liquidity targets for sweeps
+pd_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pd_low  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
 
-bear_stop   = bear_zone_hi + 1.0
-bear_risk   = bear_stop - close
-bear_target = close - bear_risk * rr_ratio
+// Current session open (another common liquidity level)
+var float sess_open = na
+in_session = not na(time("5", i_session, "America/New_York"))
+if in_session and not in_session[1]
+    sess_open := open
 
-// ─── Orders ───────────────────────────────────────────────────────────────────
+// ─── LIQUIDITY SWEEP DETECTION ────────────────────────────────────────────────
+// Sweep = wick beyond a key level, candle closes back on the other side
+bull_sweep_pd  = low < pd_low   and close > pd_low    // swept prev day low
+bear_sweep_pd  = high > pd_high and close < pd_high   // swept prev day high
+bull_sweep_so  = not na(sess_open) and low < sess_open  and close > sess_open
+bear_sweep_so  = not na(sess_open) and high > sess_open and close < sess_open
+
+bull_sweep = bull_sweep_pd or bull_sweep_so
+bear_sweep = bear_sweep_pd or bear_sweep_so
+
+// Trade remains valid for 20 bars after the sweep
+bull_swept = ta.barssince(bull_sweep) <= 20
+bear_swept = ta.barssince(bear_sweep) <= 20
+
+// ─── HTF FVG ZONES (15m, 30m, 1H, 2H) ────────────────────────────────────────
+// For a LONG: a low is swept INSIDE a BULLISH HTF FVG → price delivers up
+// For a SHORT: a high is swept INSIDE a BEARISH HTF FVG → price delivers down
+
+// 15m
+[tf15_bear_new, tf15_bear_hi_r, tf15_bear_lo_r] = request.security(syminfo.tickerid, "15",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf15_bull_new, tf15_bull_hi_r, tf15_bull_lo_r] = request.security(syminfo.tickerid, "15",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
+
+// 30m
+[tf30_bear_new, tf30_bear_hi_r, tf30_bear_lo_r] = request.security(syminfo.tickerid, "30",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf30_bull_new, tf30_bull_hi_r, tf30_bull_lo_r] = request.security(syminfo.tickerid, "30",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
+
+// 1H
+[tf60_bear_new, tf60_bear_hi_r, tf60_bear_lo_r] = request.security(syminfo.tickerid, "60",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf60_bull_new, tf60_bull_hi_r, tf60_bull_lo_r] = request.security(syminfo.tickerid, "60",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
+
+// 2H
+[tf120_bear_new, tf120_bear_hi_r, tf120_bear_lo_r] = request.security(syminfo.tickerid, "120",
+     [high < low[2] and (low[2] - high) >= i_htf_fvg_min, low[2], high], lookahead=barmerge.lookahead_off)
+[tf120_bull_new, tf120_bull_hi_r, tf120_bull_lo_r] = request.security(syminfo.tickerid, "120",
+     [low > high[2] and (low - high[2]) >= i_htf_fvg_min, low, high[2]], lookahead=barmerge.lookahead_off)
+
+// Persist the most recent zone for each TF
+var float tf15_bear_hi  = na
+var float tf15_bear_lo  = na
+var float tf15_bull_hi  = na
+var float tf15_bull_lo  = na
+var float tf30_bear_hi  = na
+var float tf30_bear_lo  = na
+var float tf30_bull_hi  = na
+var float tf30_bull_lo  = na
+var float tf60_bear_hi  = na
+var float tf60_bear_lo  = na
+var float tf60_bull_hi  = na
+var float tf60_bull_lo  = na
+var float tf120_bear_hi = na
+var float tf120_bear_lo = na
+var float tf120_bull_hi = na
+var float tf120_bull_lo = na
+
+// Update zones when a new FVG forms
+if tf15_bear_new  => tf15_bear_hi  := tf15_bear_hi_r,  tf15_bear_lo  := tf15_bear_lo_r
+if tf15_bull_new  => tf15_bull_hi  := tf15_bull_hi_r,  tf15_bull_lo  := tf15_bull_lo_r
+if tf30_bear_new  => tf30_bear_hi  := tf30_bear_hi_r,  tf30_bear_lo  := tf30_bear_lo_r
+if tf30_bull_new  => tf30_bull_hi  := tf30_bull_hi_r,  tf30_bull_lo  := tf30_bull_lo_r
+if tf60_bear_new  => tf60_bear_hi  := tf60_bear_hi_r,  tf60_bear_lo  := tf60_bear_lo_r
+if tf60_bull_new  => tf60_bull_hi  := tf60_bull_hi_r,  tf60_bull_lo  := tf60_bull_lo_r
+if tf120_bear_new => tf120_bear_hi := tf120_bear_hi_r, tf120_bear_lo := tf120_bear_lo_r
+if tf120_bull_new => tf120_bull_hi := tf120_bull_hi_r, tf120_bull_lo := tf120_bull_lo_r
+
+// Invalidate a zone if price closes through it (fully mitigated)
+if not na(tf15_bear_lo)  and close > tf15_bear_hi  => tf15_bear_hi  := na, tf15_bear_lo  := na
+if not na(tf15_bull_lo)  and close < tf15_bull_lo  => tf15_bull_hi  := na, tf15_bull_lo  := na
+if not na(tf30_bear_lo)  and close > tf30_bear_hi  => tf30_bear_hi  := na, tf30_bear_lo  := na
+if not na(tf30_bull_lo)  and close < tf30_bull_lo  => tf30_bull_hi  := na, tf30_bull_lo  := na
+if not na(tf60_bear_lo)  and close > tf60_bear_hi  => tf60_bear_hi  := na, tf60_bear_lo  := na
+if not na(tf60_bull_lo)  and close < tf60_bull_lo  => tf60_bull_hi  := na, tf60_bull_lo  := na
+if not na(tf120_bear_lo) and close > tf120_bear_hi => tf120_bear_hi := na, tf120_bear_lo := na
+if not na(tf120_bull_lo) and close < tf120_bull_lo => tf120_bull_hi := na, tf120_bull_lo := na
+
+// In zone check helpers
+in_zone(hi, lo) => not na(lo) and close >= lo and close <= hi
+
+// Is price tapping into a bearish HTF FVG on ANY valid TF? (bull setup condition)
+in_htf_bear_fvg = in_zone(tf15_bear_hi,  tf15_bear_lo)  or
+                  in_zone(tf30_bear_hi,  tf30_bear_lo)  or
+                  in_zone(tf60_bear_hi,  tf60_bear_lo)  or
+                  in_zone(tf120_bear_hi, tf120_bear_lo)
+
+// Is price tapping into a bullish HTF FVG on ANY valid TF? (bear setup condition)
+in_htf_bull_fvg = in_zone(tf15_bull_hi,  tf15_bull_lo)  or
+                  in_zone(tf30_bull_hi,  tf30_bull_lo)  or
+                  in_zone(tf60_bull_hi,  tf60_bull_lo)  or
+                  in_zone(tf120_bull_hi, tf120_bull_lo)
+
+// ─── 5M FVG DETECTION ─────────────────────────────────────────────────────────
+new_bull_fvg = low > high[2] and (low - high[2]) >= i_fvg_min
+new_bear_fvg = high < low[2] and (low[2] - high) >= i_fvg_min
+
+var float bull_fvg_hi = na
+var float bull_fvg_lo = na
+var bool  bull_fvg_on = false
+var float bear_fvg_hi = na
+var float bear_fvg_lo = na
+var bool  bear_fvg_on = false
+
+if new_bull_fvg
+    bull_fvg_hi := low       // top of gap = current bar's low
+    bull_fvg_lo := high[2]   // bot of gap = 2 bars ago high
+    bull_fvg_on := true
+
+if new_bear_fvg
+    bear_fvg_hi := low[2]    // top of gap = 2 bars ago low
+    bear_fvg_lo := high      // bot of gap = current bar's high
+    bear_fvg_on := true
+
+// Invalidate FVG if price closes beyond it
+if bull_fvg_on and close < bull_fvg_lo
+    bull_fvg_on := false
+
+if bear_fvg_on and close > bear_fvg_hi
+    bear_fvg_on := false
+
+// IFVG entry: price has retraced back into the 5m FVG zone
+bull_ifvg = bull_fvg_on and close >= bull_fvg_lo and close <= bull_fvg_hi
+bear_ifvg = bear_fvg_on and close >= bear_fvg_lo and close <= bear_fvg_hi
+
+// ─── DYNAMIC STOP LOSS (previous swing + buffer) ──────────────────────────────
+bull_stop = ta.lowest(low, i_swing_lb)  - i_stop_buf
+bear_stop = ta.highest(high, i_swing_lb) + i_stop_buf
+
+// ─── POSITION SIZING ($100 risk cap) ──────────────────────────────────────────
+bull_dist    = math.max(close - bull_stop, 0.25)
+bear_dist    = math.max(bear_stop - close, 0.25)
+bull_risk_1c = bull_dist * i_mnq_pt
+bear_risk_1c = bear_dist * i_mnq_pt
+
+// Contracts = floor($100 / risk per contract), min 1
+bull_qty  = math.max(1.0, math.floor(i_risk / bull_risk_1c))
+bear_qty  = math.max(1.0, math.floor(i_risk / bear_risk_1c))
+
+// Skip if even 1 contract exceeds the max risk threshold
+bull_skip = bull_risk_1c > i_max_risk
+bear_skip = bear_risk_1c > i_max_risk
+
+// Actual USD risk for display / webhook
+bull_actual_risk = bull_qty * bull_risk_1c
+bear_actual_risk = bear_qty * bear_risk_1c
+
+// ─── TARGETS & BREAK EVEN ─────────────────────────────────────────────────────
+bull_target = close + bull_dist * i_rr
+bull_be     = close + bull_dist          // 1R hit = move stop to entry
+bear_target = close - bear_dist * i_rr
+bear_be     = close - bear_dist
+
+// ─── DELIVERY CONFIRMATION ────────────────────────────────────────────────────
+// The sweep low (long) or sweep high (short) must be within i_sweep_gap points
+// of ANY bullish/bearish HTF FVG zone. Does not have to be strictly inside.
+
+near_bull_fvg = (not na(tf15_bull_lo)  and low >= tf15_bull_lo  - i_sweep_gap and low <= tf15_bull_hi  + i_sweep_gap) or
+                (not na(tf30_bull_lo)  and low >= tf30_bull_lo  - i_sweep_gap and low <= tf30_bull_hi  + i_sweep_gap) or
+                (not na(tf60_bull_lo)  and low >= tf60_bull_lo  - i_sweep_gap and low <= tf60_bull_hi  + i_sweep_gap) or
+                (not na(tf120_bull_lo) and low >= tf120_bull_lo - i_sweep_gap and low <= tf120_bull_hi + i_sweep_gap)
+
+near_bear_fvg = (not na(tf15_bear_lo)  and high <= tf15_bear_hi  + i_sweep_gap and high >= tf15_bear_lo  - i_sweep_gap) or
+                (not na(tf30_bear_lo)  and high <= tf30_bear_hi  + i_sweep_gap and high >= tf30_bear_lo  - i_sweep_gap) or
+                (not na(tf60_bear_lo)  and high <= tf60_bear_hi  + i_sweep_gap and high >= tf60_bear_lo  - i_sweep_gap) or
+                (not na(tf120_bear_lo) and high <= tf120_bear_hi + i_sweep_gap and high >= tf120_bear_lo - i_sweep_gap)
+
+// Delivery confirmed: sweep near the FVG within the last 20 bars
+bull_delivery = ta.barssince(bull_sweep and near_bull_fvg) <= 20
+bear_delivery = ta.barssince(bear_sweep and near_bear_fvg) <= 20
+
+// ─── ENTRY CONDITIONS (ALL must be true) ──────────────────────────────────────
+bull_entry = htf_bull
+           and bull_delivery
+           and bull_ifvg
+           and not bull_skip
+           and in_session
+           and strategy.position_size == 0
+
+bear_entry = htf_bear
+           and bear_delivery
+           and bear_ifvg
+           and not bear_skip
+           and in_session
+           and strategy.position_size == 0
+
+// ─── ORDERS ───────────────────────────────────────────────────────────────────
 if bull_entry
-    strategy.entry("Long", strategy.long, qty=qty,
-         alert_message='{"action":"buy","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(bull_stop) + ',"target":' + str.tostring(bull_target) + ',"qty":' + str.tostring(qty) + '}')
-    strategy.exit("Long TP/SL", from_entry="Long", stop=bull_stop, limit=bull_target)
+    bull_fvg_on := false
+    strategy.entry("Long", strategy.long, qty=bull_qty,
+         alert_message='{"action":"buy","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(math.round(bull_stop, 2)) + ',"target":' + str.tostring(math.round(bull_target, 2)) + ',"be":' + str.tostring(math.round(bull_be, 2)) + ',"qty":' + str.tostring(bull_qty, "#") + ',"risk":' + str.tostring(math.round(bull_actual_risk, 2)) + '}')
+    strategy.exit("Long Exit", from_entry="Long", stop=bull_stop, limit=bull_target)
 
 if bear_entry
-    strategy.entry("Short", strategy.short, qty=qty,
-         alert_message='{"action":"sell","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(bear_stop) + ',"target":' + str.tostring(bear_target) + ',"qty":' + str.tostring(qty) + '}')
-    strategy.exit("Short TP/SL", from_entry="Short", stop=bear_stop, limit=bear_target)
+    bear_fvg_on := false
+    strategy.entry("Short", strategy.short, qty=bear_qty,
+         alert_message='{"action":"sell","ticker":"{{ticker}}","price":{{close}},"stop":' + str.tostring(math.round(bear_stop, 2)) + ',"target":' + str.tostring(math.round(bear_target, 2)) + ',"be":' + str.tostring(math.round(bear_be, 2)) + ',"qty":' + str.tostring(bear_qty, "#") + ',"risk":' + str.tostring(math.round(bear_actual_risk, 2)) + '}')
+    strategy.exit("Short Exit", from_entry="Short", stop=bear_stop, limit=bear_target)
 
-// ─── Visuals ──────────────────────────────────────────────────────────────────
-var box bull_box = na
-var box bear_box = na
+// ─── VISUALS ──────────────────────────────────────────────────────────────────
+// Previous day H/L liquidity lines
+plot(pd_high, "PDH", color=color.new(color.orange, 20), linewidth=1, style=plot.style_stepline)
+plot(pd_low,  "PDL", color=color.new(color.orange, 20), linewidth=1, style=plot.style_stepline)
 
-if bull_fvg
-    bull_box := box.new(bar_index - 2, low, bar_index, high[2],
-         border_color=color.new(color.green, 0), bgcolor=color.new(color.green, 80))
+// HTF bias label (top right)
+var label bias_lbl = na
+label.delete(bias_lbl)
+bias_txt   = htf_bull ? "HTF: BULL" : htf_bear ? "HTF: BEAR" : "HTF: NEUTRAL"
+bias_color = htf_bull ? color.green : htf_bear ? color.red : color.gray
+bias_lbl  := label.new(bar_index, high, bias_txt, style=label.style_label_left,
+              color=bias_color, textcolor=color.white, size=size.small)
 
-if bear_fvg
-    bear_box := box.new(bar_index - 2, high, bar_index, low[2],
-         border_color=color.new(color.red, 0), bgcolor=color.new(color.red, 80))
+// HTF FVG zones (background shading)
+bgcolor(in_htf_bull_fvg ? color.new(color.green, 88) : na, title="In HTF Bull FVG (long delivery zone)")
+bgcolor(in_htf_bear_fvg ? color.new(color.red,   88) : na, title="In HTF Bear FVG (short delivery zone)")
 
-plotshape(bull_entry, "Bull Entry", shape.triangleup,   location.belowbar, color.green, size=size.small)
-plotshape(bear_entry, "Bear Entry", shape.triangledown, location.abovebar, color.red,   size=size.small)
+// 5m FVG boxes
+if new_bull_fvg
+    box.new(bar_index - 2, bull_fvg_hi, bar_index + 8, bull_fvg_lo,
+         border_color=color.new(color.teal, 20),  bgcolor=color.new(color.teal, 80))
+if new_bear_fvg
+    box.new(bar_index - 2, bear_fvg_hi, bar_index + 8, bear_fvg_lo,
+         border_color=color.new(color.maroon, 20), bgcolor=color.new(color.maroon, 80))
+
+// Sweep markers
+plotshape(bull_sweep, "Bull Sweep", shape.xcross, location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(bear_sweep, "Bear Sweep", shape.xcross, location.abovebar, color.new(color.red,   0), size=size.tiny)
+
+// Entry signals
+plotshape(bull_entry, "Long Entry",  shape.triangleup,   location.belowbar, color.lime, size=size.normal)
+plotshape(bear_entry, "Short Entry", shape.triangledown, location.abovebar, color.red,  size=size.normal)

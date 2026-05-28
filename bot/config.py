@@ -23,8 +23,14 @@ BASE_URLS = {
 }
 BASE_URL = BASE_URLS[TRADOVATE_ENV]
 
-# MNQ (Micro E-mini Nasdaq) instrument details
-# Swap INSTRUMENT to "NQM5" and TICK_VALUE to 20.0 for full NQ
-INSTRUMENT    = os.getenv("INSTRUMENT", "MNQM5")  # update expiry each quarter
-TICK_SIZE     = 0.25   # minimum price move in points
-TICK_VALUE    = 2.0    # USD per tick — MNQ=$2, NQ=$20
+# MNQ instrument — update the expiry code each quarter (M5=June, U5=Sep, Z5=Dec, H6=Mar)
+INSTRUMENT    = os.getenv("INSTRUMENT", "MNQM5")
+MNQ_PER_POINT = float(os.getenv("MNQ_PER_POINT", "2.0"))  # $2/pt MNQ, $20/pt NQ
+
+# Risk management hard caps (Python-side safety net, mirrors Pine Script)
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "100.0"))
+MAX_RISK_USD   = float(os.getenv("MAX_RISK_USD",   "130.0"))
+
+# Telegram notifications (optional — leave blank to disable)
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
