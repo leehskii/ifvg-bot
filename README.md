@@ -47,4 +47,4 @@ python bot/main.py
 
 ## Disclaimer
 
-This bot is for educational purposes. Trading futures carries significant financial risk.
+This bot is for educational purposes only. Trading futures carries **significant financial risk** and you may lose more than your initial investment. Always test on a demo account before going live. Past performance does not guarantee future results.
