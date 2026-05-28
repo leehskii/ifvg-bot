@@ -1,0 +1,30 @@
+//@version=5
+strategy("IFVG Bot Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// --- Inputs ---
+lookback     = input.int(3,   title="Lookback bars for FVG",   minval=2)
+fvg_min_size = input.float(0.0, title="Minimum FVG size (points)", minval=0.0)
+webhook_msg  = input.string("{{strategy.order.action}},{{ticker}},{{close}}", title="Webhook message template")
+
+// --- Fair Value Gap detection ---
+// A bullish FVG exists when: low[0] > high[2]  (gap between candle i-2 high and candle i low)
+// A bearish FVG exists when: high[0] < low[2]
+
+bullish_fvg = low > high[2] and (low - high[2]) >= fvg_min_size
+bearish_fvg = high < low[2] and (low[2] - high) >= fvg_min_size
+
+// --- Imbalance confirmation (price returns to fill the gap) ---
+bull_entry = bullish_fvg[lookback] and close <= high[2 + lookback] + (low[lookback] - high[2 + lookback]) * 0.5
+bear_entry = bearish_fvg[lookback] and close >= low[2 + lookback] - (low[2 + lookback] - high[lookback]) * 0.5
+
+// --- Orders ---
+if bull_entry
+    strategy.entry("Long", strategy.long, alert_message=webhook_msg)
+
+if bear_entry
+    strategy.entry("Short", strategy.short, alert_message=webhook_msg)
+
+// --- Visuals ---
+bgcolor(bullish_fvg ? color.new(color.green, 85) : bearish_fvg ? color.new(color.red, 85) : na)
+plotshape(bull_entry, title="Bull IFVG", location=location.belowbar, color=color.green, style=shape.triangleup,  size=size.small)
+plotshape(bear_entry, title="Bear IFVG", location=location.abovebar, color=color.red,   style=shape.triangledown, size=size.small)
