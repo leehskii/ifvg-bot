@@ -9,6 +9,7 @@ i_htf_ema     = input.int(20,    "HTF EMA period (1H & 2H)",          group="HTF
 
 i_fvg_min     = input.float(3.0,  "Min 5m FVG size (pts)",            group="FVG", step=0.25)
 i_htf_fvg_min = input.float(10.0, "Min HTF FVG size (pts)",            group="FVG", step=1.0)
+i_sweep_gap   = input.float(20.0, "Max sweep-to-FVG gap (pts)",        group="FVG", step=1.0)
 i_swing_lb    = input.int(10,    "Swing lookback (bars)",              group="FVG")
 
 i_risk        = input.float(100.0, "Risk per trade ($)",               group="Risk")
@@ -195,14 +196,26 @@ bear_target = close - bear_dist * i_rr
 bear_be     = close - bear_dist
 
 // ─── DELIVERY CONFIRMATION ────────────────────────────────────────────────────
-// Sweep must have occurred INSIDE the HTF FVG — that's the delivery origin
-bull_delivery = ta.barssince(bull_sweep and in_htf_bull_fvg) <= 20
-bear_delivery = ta.barssince(bear_sweep and in_htf_bear_fvg) <= 20
+// The sweep low (long) or sweep high (short) must be within i_sweep_gap points
+// of ANY bullish/bearish HTF FVG zone. Does not have to be strictly inside.
+
+near_bull_fvg = (not na(tf15_bull_lo)  and low >= tf15_bull_lo  - i_sweep_gap and low <= tf15_bull_hi  + i_sweep_gap) or
+                (not na(tf30_bull_lo)  and low >= tf30_bull_lo  - i_sweep_gap and low <= tf30_bull_hi  + i_sweep_gap) or
+                (not na(tf60_bull_lo)  and low >= tf60_bull_lo  - i_sweep_gap and low <= tf60_bull_hi  + i_sweep_gap) or
+                (not na(tf120_bull_lo) and low >= tf120_bull_lo - i_sweep_gap and low <= tf120_bull_hi + i_sweep_gap)
+
+near_bear_fvg = (not na(tf15_bear_lo)  and high <= tf15_bear_hi  + i_sweep_gap and high >= tf15_bear_lo  - i_sweep_gap) or
+                (not na(tf30_bear_lo)  and high <= tf30_bear_hi  + i_sweep_gap and high >= tf30_bear_lo  - i_sweep_gap) or
+                (not na(tf60_bear_lo)  and high <= tf60_bear_hi  + i_sweep_gap and high >= tf60_bear_lo  - i_sweep_gap) or
+                (not na(tf120_bear_lo) and high <= tf120_bear_hi + i_sweep_gap and high >= tf120_bear_lo - i_sweep_gap)
+
+// Delivery confirmed: sweep near the FVG within the last 20 bars
+bull_delivery = ta.barssince(bull_sweep and near_bull_fvg) <= 20
+bear_delivery = ta.barssince(bear_sweep and near_bear_fvg) <= 20
 
 // ─── ENTRY CONDITIONS (ALL must be true) ──────────────────────────────────────
 bull_entry = htf_bull
            and bull_delivery
-           and in_htf_bull_fvg
            and bull_ifvg
            and not bull_skip
            and in_session
@@ -210,7 +223,6 @@ bull_entry = htf_bull
 
 bear_entry = htf_bear
            and bear_delivery
-           and in_htf_bear_fvg
            and bear_ifvg
            and not bear_skip
            and in_session
